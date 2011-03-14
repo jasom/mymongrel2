@@ -1,4 +1,4 @@
-
+(declaim (optimize (speed 3)))
 (in-package :mymongrel2)
 
 (defparameter *zmq-context* nil)
@@ -11,10 +11,31 @@
     (zmq:recv socket query)
     (zmq:msg-data-as-string query)))
 (defparameter +http-format+ 
-		     "HTTP/1.1 ~A ~A
+  "HTTP/1.1 ~A ~A
 ~:{~A: ~A
 ~}
 ~A")
+
+(defparameter +crlf+ "
+")
+
+(defparameter +chunk-format+
+  "~X
+~A
+")
+
+(defun format-chunk (stream &rest rest)
+  (apply #'format stream 
+	  "~X
+~A
+" rest))
+
+(defun format-http (stream &rest rest)
+  (apply #'format stream 
+  "HTTP/1.1 ~A ~A
+~:{~A: ~A
+~}
+~A" rest))
 
 (defmacro with-connection ((conn &rest init-args)
                            &body body)
@@ -24,8 +45,9 @@
 	 (close-connection ,conn))))
 
 (defun http-response (body code status headers)
+  (declare (type string body))
   (let ((headers (acons "Content-Length" (length body) headers)))
-    (format nil +http-format+ code status
+    (format-http nil code status
 	    (mapcar (lambda (x) (list (car x) (cdr x))) headers)
 	    body)))
 
@@ -41,9 +63,11 @@
 ;divided by 'c'
   (if strng
     (let ((string strng))
-      (declare (type vector string))
-      (loop for i = 0 then (1+ j)
-            for count = 1 then (1+ count)
+      (declare (type string string)
+	       (type (or nil fixnum) max-splits)
+	       (type character split-char))
+      (loop for i fixnum = 0 then (1+ j)
+            for count fixnum = 1 then (1+ count)
 		      as j = (position split-char string :start i)
                         when (and max-splits (= count max-splits))
                           collect (subseq string i) into splits
@@ -52,6 +76,7 @@
                         when (null j) return splits))))
 
 (defun parse-netstring (ns)
+  (declare (type string ns))
   (let* ((p (position #\: ns))
          (len (subseq ns 0 p))
          (rest (subseq ns (1+ p)))
@@ -69,8 +94,8 @@
 
 
 (defun request-disconnectp (req)
-  (if (equalp (assoc :+METHOD+ (request-headers req)) "JSON")
-      (equalp (assoc :type (request-headers req)) "disconnect")))
+  (and (equalp (cdr (assoc :+METHOD+ (request-headers req))) "JSON")
+       (equalp (cdr (assoc :type (json:decode-json-from-string (request-body req)))) "disconnect")))
 
 
 (defun parse (msg)
@@ -112,13 +137,14 @@
   (zmq:close (slot-value c 'resp)))
 
 
-(defun connection-recv (connection)
+(defun recv (connection)
   (parse (zmq-recv-string (slot-value connection 'reqs))))
 
-(defun connection-recv-json (connection)
-  (json:decode-json-from-string (connection-recv connection)))
+(defun recv-json (connection)
+  (json:decode-json-from-string (recv connection)))
 
-(defun connection-send (connection uuid conn-id msg)
+(defun send (connection uuid conn-id msg)
+  (declare (type vector conn-id))
   (zmq:send (slot-value connection 'resp)
 	    (make-instance 'zmq:msg
 			   :data (format nil "~A ~A:~A, ~A"
@@ -127,30 +153,53 @@
 					 conn-id
 					 msg))))
 
-(defun connection-reply (connection req msg)
-  (connection-send connection (request-sender req) (request-conn-id req) msg))
+(defun reply (connection req msg)
+  (send connection (request-sender req) (request-conn-id req) msg))
 
 (defun reply-json (connection req data)
-  (connection-reply connection req (json:decode-json-from-string data)))
+  (reply connection req (json:decode-json-from-string data)))
 
 (defun reply-http (connection req body &key (code 200) (status "OK") headers)
-  (connection-reply connection req (http-response body code status headers)))
+  (declare (type string body))
+  (reply connection req (http-response body code status headers)))
 
-(defun connection-deliver (connection uuid idents data)
-  (connection-send connection uuid (string-join " " idents) data))
+(defun reply-start-chunk (connection req &key (code 200) (status "OK") headers)
+  (declare (type list headers))
+  (let ((headers (acons "Transfer-Encoding" "chunked" headers)))
+    (declare (type list headers))
+    (reply connection req 
+	   (format-http nil code status
+		   (mapcar (lambda (x) (list (car x) (cdr x))) headers)
+		   ""))))
 
-(defun connection-deliver-json (connection uuid idents data)
-  (connection-deliver connection uuid idents (json:encode-json-to-string data)))
+(defun reply-a-chunk (connection req body)
+  (declare (type string body))
+  (reply connection req
+	 (format-chunk nil (length body) body)))
 
-(defun connection-deliver-http
+(defun reply-finish-chunk (connection req)
+  (reply-a-chunk connection req "")
+  (reply connection req +crlf+))
+
+(defun deliver (connection uuid idents data)
+  (send connection uuid (string-join " " idents) data))
+
+(defun deliver-json (connection uuid idents data)
+  (deliver connection uuid idents (json:encode-json-to-string data)))
+
+(defun deliver-http
     (connection uuid idents body &key (code 200) (status "OK") headers)
-  (connection-deliver connection uuid idents (http-response body code status headers)))
+  (deliver connection uuid idents (http-response body code status headers)))
 
-(defun connection-close (connection req)
-  (connection-reply connection req ""))
+(defun reply-close (connection req)
+  (reply connection req ""))
 
-(defun connection-deliver-close (connection uuid idents)
-  (connection-deliver connection uuid idents ""))
+(defun request-closep (req)
+  (or (equalp (cdr (assoc :connection (request-headers req))) "close")
+      (equalp (cdr (assoc :+version+ (request-headers req))) "HTTP/1.0")))
+
+(defun deliver-close (connection uuid idents)
+  (deliver connection uuid idents ""))
  
 (defun simple-test ()
   (with-connection (conn
@@ -158,7 +207,7 @@
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
     (loop
-       (let ((req (connection-recv conn)))
+       (let ((req (recv conn)))
          (reply-http conn req "Hello, World!")))))
 
 
@@ -168,8 +217,33 @@
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
     (loop
-       (print "WAITING FOR REQUEST")
-       (let ((req (connection-recv conn)))
+       ;(print "WAITING FOR REQUEST")
+       (let ((req (recv conn)))
+	 (cond
+	   ((request-disconnectp req)
+	    (print "DISCONNECT"))
+	    ;(reply-close conn req))
+	   ((assoc :killme (request-headers req))
+	    (print "They want to be killed.")
+	    (reply-close conn req))
+	   (t
+	    (reply-http conn req
+			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
+				(request-sender req) (request-conn-id req)
+				(request-path req) (request-headers req)
+				(request-body req)))
+	    (when (request-closep req)
+	      (reply-close conn req))))))))
+         
+
+(defun test-chunking ()
+  (with-connection (conn
+		    "82209006-86FF-4982-B5EA-D1E29E55D483"
+		    "tcp://127.0.0.1:9997"
+		    "tcp://127.0.0.1:9996")
+    (loop
+       ;(print "WAITING FOR REQUEST")
+       (let ((req (recv conn)))
 	 (cond
 	   ((request-disconnectp req)
 	    (print "DISCONNECT"))
@@ -177,10 +251,27 @@
 	    (print "They want to be killed.")
 	    (reply-http conn req ""))
 	   (t
-	    (reply-http conn req
-			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
-				(request-sender req) (request-conn-id req)
-				(request-path req) (request-headers req)
-				(request-body req)))))))))
-         
+	    (reply-start-chunk conn req)
+	    (reply-a-chunk conn req
+			   "<http><head><title>foo</title></head><body>")
+	    (reply-a-chunk conn req
+			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&"
+				(request-sender req) (request-conn-id req)))
+	    (reply-a-chunk conn req
+			(format nil "PATH: ~A~&HEADERS: ~A"
+				(request-path req) (request-headers req)))
+	    (reply-a-chunk conn req
+			(format nil "~&BODY~A</pre>" (request-body req)))
+	    (reply-finish-chunk conn req)))
+	 (when (request-closep req)
+	   (reply-close conn req))))))
 
+(defun always-close ()
+  (with-connection (conn
+		    "82209006-86FF-4982-B5EA-D1E29E55D483"
+		    "tcp://127.0.0.1:9997"
+		    "tcp://127.0.0.1:9996")
+    (loop
+       ;(print "WAITING FOR REQUEST")
+       (let ((req (recv conn)))
+	 (reply conn req "")))))
