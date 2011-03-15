@@ -167,7 +167,7 @@
 
 (defun reply-json (connection req data)
   "Sends a reply to request object, encoding the data as JSON"
-  (reply connection req (json:decode-json-from-string data)))
+  (reply connection req (json:encode-json-to-string data)))
 
 (defun reply-http (connection req body &key (code 200) (status "OK") headers)
   "Sends a reply to a request, prepending an http header"
@@ -214,8 +214,8 @@
   (deliver connection uuid idents (json:encode-json-to-string data)))
 
 (defun deliver-http
+  (connection uuid idents body &key (code 200) (status "OK") headers)
   "Like deliver, but prepend an HTTP header"
-    (connection uuid idents body &key (code 200) (status "OK") headers)
   (deliver connection uuid idents (http-response body code status headers)))
 
 (defun reply-close (connection req)
