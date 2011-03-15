@@ -9,7 +9,6 @@
              :format-chunk
              :format-http
              :with-connection
-             :http-response
              :parse-netstring
              :request-disconnectp
              :connection
@@ -30,4 +29,10 @@
              :reply-close
              :request-closep
              :deliver-close
+             :request-sender
+             :request-body
+             :request-conn-id
+             :request-path
+             :request-headers
+             :request-body
              )))
