@@ -1,6 +1,9 @@
 (declaim (optimize (speed 3)))
 (in-package :mymongrel2)
 
+(eval-when (:compile-toplevel :load-toplevel :execute) (defvar *con-fun-list* nil))
+
+
 (defparameter *zmq-context* nil)
 
 (defun ensure-zmq-init (&optional (threads 1))
@@ -27,7 +30,36 @@
 ~}
 ~A" rest))
 
+(defun wrap-function (defaultarg name &rest args)
+  (list name (cdr args) `(,name ,defaultarg ,@(cdr args))))
+
+(defmacro def-con-fun (name (&rest args)
+                            &body body)
+  "Defines a function and adds it to the list to be wrapped"
+  `(progn
+     (defun ,name ,args ,@body)
+     (eval-when (:compile-toplevel :load-toplevel :execute)
+       (push (cons (quote ,name) (quote ,args)) *con-fun-list*))))
+
 (defmacro with-connection ((conn &rest init-args)
+                           &body body)
+  "Creates a connection and executes body within it.  Also rebinds all
+   functions that take a symbol to take the connection implicitly"
+   #|(print *con-fun-list*)
+   (print (mapcar (lambda (x)
+                        (list (car x) (cddr x) `(,(car x) conn ,@(cddr x))))
+                      *con-fun-list*))|#
+   (let ()
+     `(let ((,conn (make-connection ,@init-args)))
+        (flet ,(mapcar (lambda (x)
+                         (list (car x) `(&rest r)
+                               `(apply (function ,(car x)),conn r)))
+                       *con-fun-list*)
+          (unwind-protect
+            (progn ,@body)
+            (close-connection ,conn))))))
+
+(defmacro with-connection-nowrap ((conn &rest init-args)
                            &body body)
   "Creates a connection and executes body within it.
    Basically, all your mongrel2 stuff should be wrapped in this."
@@ -142,15 +174,15 @@
   (zmq:close (slot-value c 'resp)))
 
 
-(defun recv (connection)
+(def-con-fun recv (connection)
   "Receives a single message from mongrel2"
   (parse (zmq-recv-string (slot-value connection 'reqs))))
 
-(defun recv-json (connection)
+(def-con-fun recv-json (connection)
   "Receives a single message from mongrel2 and decodes as JSON"
   (json:decode-json-from-string (recv connection)))
 
-(defun send (connection uuid conn-id msg)
+(def-con-fun send (connection uuid conn-id msg)
   "Sends a single message to mongrel2"
   (declare (type vector conn-id))
   (zmq:send (slot-value connection 'resp)
@@ -161,15 +193,15 @@
 					 conn-id
 					 msg))))
 
-(defun reply (connection req msg)
+(def-con-fun reply (connection req msg)
   "Sends a reply to a request object"
   (send connection (request-sender req) (request-conn-id req) msg))
 
-(defun reply-json (connection req data)
+(def-con-fun reply-json (connection req data)
   "Sends a reply to request object, encoding the data as JSON"
   (reply connection req (json:encode-json-to-string data)))
 
-(defun reply-http (connection req body &key (code 200) (status "OK") headers)
+(def-con-fun reply-http (connection req body &key (code 200) (status "OK") headers)
   "Sends a reply to a request, prepending an http header"
   (declare (type string body))
   (reply connection req (http-response body code status headers)))
@@ -193,23 +225,23 @@
 		   (mapcar (lambda (x) (list (car x) (cdr x))) headers)
 		   ""))))
 
-(defun reply-a-chunk (connection req body)
+(def-con-fun reply-a-chunk (connection req body)
   "Sends some data to a request that reply-start-chunk has already been called
   on"
   (declare (type string body))
   (reply connection req
 	 (format-chunk nil (length body) body)))
 
-(defun reply-finish-chunk (connection req)
+(def-con-fun reply-finish-chunk (connection req)
   "Finishes a request that reply-start-chunk has already been called on."
   (reply-a-chunk connection req "")
   (reply connection req +crlf+))
 
-(defun deliver (connection uuid idents data)
+(def-con-fun deliver (connection uuid idents data)
   "Send message to mongrel2 for all idents"
   (send connection uuid (string-join " " idents) data))
 
-(defun deliver-json (connection uuid idents data)
+(def-con-fun deliver-json (connection uuid idents data)
   "Like deliver, but encode data as JSON"
   (deliver connection uuid idents (json:encode-json-to-string data)))
 
@@ -218,7 +250,7 @@
   "Like deliver, but prepend an HTTP header"
   (deliver connection uuid idents (http-response body code status headers)))
 
-(defun reply-close (connection req)
+(def-con-fun reply-close (connection req)
   "Instruct mongrel2 to close a connection"
   (reply connection req ""))
 
@@ -227,12 +259,12 @@
   (or (equalp (cdr (assoc :connection (request-headers req))) "close")
       (equalp (cdr (assoc :+version+ (request-headers req))) "HTTP/1.0")))
 
-(defun deliver-close (connection uuid idents)
+(def-con-fun deliver-close (connection uuid idents)
   "Instruct mongrel2 to close all connections in idents"
   (deliver connection uuid idents ""))
  
 (defun simple-test ()
-  (with-connection (conn
+  (with-connection-nowrap (conn
 		    "82209006-86FF-4982-B5EA-D1E29E55D483"
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
@@ -242,32 +274,32 @@
 
 
 (defun example-from-docs ()
-  (with-connection (conn
+  (with-connection (foo
 		    "82209006-86FF-4982-B5EA-D1E29E55D483"
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
     (loop
        ;(print "WAITING FOR REQUEST")
-       (let ((req (recv conn)))
+       (let ((req (recv)))
 	 (cond
 	   ((request-disconnectp req)
 	    (print "DISCONNECT"))
 	    ;(reply-close conn req))
 	   ((assoc :killme (request-headers req))
 	    (print "They want to be killed.")
-	    (reply-close conn req))
+	    (reply-close req))
 	   (t
-	    (reply-http conn req
+	    (reply-http req
 			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
 				(request-sender req) (request-conn-id req)
 				(request-path req) (request-headers req)
 				(request-body req)))
 	    (when (request-closep req)
-	      (reply-close conn req))))))))
+	      (reply-close req))))))))
          
 
 (defun test-chunking ()
-  (with-connection (conn
+  (with-connection-nowrap (conn
 		    "82209006-86FF-4982-B5EA-D1E29E55D483"
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
