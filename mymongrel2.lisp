@@ -4,13 +4,16 @@
 (eval-when (:compile-toplevel :load-toplevel :execute) (defvar *con-fun-list* nil))
 
 
+(defvar *current-connection* nil)
+
 (defparameter *zmq-context* nil)
 
 (defun ensure-zmq-init (&optional (threads 1))
     (unless *zmq-context* (setq *zmq-context* (zmq:init threads))))
 
 (defun zmq-recv-string (socket)
-  (let ((query (make-instance 'zmq:msg)))
+  (let ((query (make-instance 'zmq:msg))
+	(cffi:*default-foreign-encoding* :iso-8859-1))
     (zmq:recv socket query)
     (zmq:msg-data-as-string query)))
 
@@ -30,34 +33,21 @@
 ~}
 ~A" rest))
 
-(defun wrap-function (defaultarg name &rest args)
-  (list name (cdr args) `(,name ,defaultarg ,@(cdr args))))
+(defun myjson-decode (s)
+  (let ((json:*lisp-identifier-name-to-json* (lambda (x) x))
+	(json:*json-identifier-name-to-lisp* (lambda (x) x)))
+    (json:decode-json-from-string s)))
 
-(defmacro def-con-fun (name (&rest args)
-                            &body body)
-  "Defines a function and adds it to the list to be wrapped"
-  `(progn
-     (defun ,name ,args ,@body)
-     (eval-when (:compile-toplevel :load-toplevel :execute)
-       (push (cons (quote ,name) (quote ,args)) *con-fun-list*))))
 
 (defmacro with-connection ((conn &rest init-args)
                            &body body)
   "Creates a connection and executes body within it.  Also rebinds all
    functions that take a symbol to take the connection implicitly"
-   #|(print *con-fun-list*)
-   (print (mapcar (lambda (x)
-                        (list (car x) (cddr x) `(,(car x) conn ,@(cddr x))))
-                      *con-fun-list*))|#
-   (let ()
      `(let ((,conn (make-connection ,@init-args)))
-        (flet ,(mapcar (lambda (x)
-                         (list (car x) `(&rest r)
-                               `(apply (function ,(car x)),conn r)))
-                       *con-fun-list*)
           (unwind-protect
-            (progn ,@body)
-            (close-connection ,conn))))))
+            (let ((*current-connection* ,conn))
+	      ,@body)
+            (close-connection ,conn))))
 
 (defmacro with-connection-nowrap ((conn &rest init-args)
                            &body body)
@@ -102,20 +92,6 @@
                         collect (subseq string i j) into splits
                         when (null j) return splits))))
 
-(defun parse-netstring (ns)
-  "Parses a netstring into a string, which is basically:
-  LENGTH ':' DATA ','
-
-  Note that coding errors are possible here, but that should only a body issue
-  since mongrel2 requires ascii in the headers"
-  (declare (type string ns))
-  (let* ((p (position #\: ns))
-         (len (subseq ns 0 p))
-         (rest (subseq ns (1+ p)))
-         (len (parse-integer len)))
-    (unless (eql (char rest len) #\,) (error 'parse-error ns))
-    (values (subseq rest 0 len) (subseq rest (1+ len)))))
-
 
 (defstruct request ()
 	   (sender)
@@ -127,18 +103,35 @@
 
 (defun request-disconnectp (req)
   "Returns true if a request should be followed by a disconnect"
-  (and (equalp (cdr (assoc :+METHOD+ (request-headers req))) "JSON")
-       (equalp (cdr (assoc :type (json:decode-json-from-string (request-body req)))) "disconnect")))
+  (and (equalp (cdr (assoc :METHOD (request-headers req))) "JSON")
+       (equalp (cdr (assoc :|type| (myjson-decode (request-body req)))) "disconnect")))
+
+
+(defun mongrel2-header1 (s)
+  (values
+   (with-output-to-string (out)
+     (loop for c = (tnetstring::fss-read-char s)
+	  while (not (eql c #\Space))
+	  do (write-char c out)))
+   (with-output-to-string (out)
+     (loop for c = (tnetstring::fss-read-char s)
+	  while (not (eql c #\Space))
+	  do (write-char c out)))
+   (with-output-to-string (out)
+     (loop for c = (tnetstring::fss-read-char s)
+	  while (not (eql c #\Space))
+	  do (write-char c out)))))
 
 
 (defun parse (msg)
   "Parses out the mongrel2 message format which is:
   UUID ID PATH SIZE:HEADERS,SIZE:BODY,"
-  (destructuring-bind (sender conn-id path rest)
-      (split-by-char msg :max-splits 4)
-    (multiple-value-bind (headers rest) (parse-netstring rest)
-      (let* ((body (parse-netstring rest))
-	     (headers (json:decode-json-from-string headers)))
+  (let ((fss
+	 (tnetstring::make-fake-string-stream :data msg :length (length msg))))
+  (multiple-value-bind (sender conn-id path) (mongrel2-header1 fss)
+    (let* ((headers (tnetstring::parse-tnetstream fss))
+	   (body (tnetstring::parse-tnetstream fss))
+	   (headers (myjson-decode headers)))
 	(make-request :sender sender
 		      :conn-id conn-id
 		      :path path
@@ -174,16 +167,19 @@
   (zmq:close (slot-value c 'resp)))
 
 
-(def-con-fun recv (connection)
+(defun recv (&optional (connection *current-connection*))
   "Receives a single message from mongrel2"
+  (declare (type connection connection))
   (parse (zmq-recv-string (slot-value connection 'reqs))))
 
-(def-con-fun recv-json (connection)
+(defun recv-json (&optional (connection *current-connection*))
   "Receives a single message from mongrel2 and decodes as JSON"
+  (declare (type connection connection))
   (json:decode-json-from-string (recv connection)))
 
-(def-con-fun send (connection uuid conn-id msg)
+(defun send (uuid conn-id msg &optional (connection *current-connection*))
   "Sends a single message to mongrel2"
+  (declare (type connection connection))
   (declare (type vector conn-id))
   (zmq:send (slot-value connection 'resp)
 	    (make-instance 'zmq:msg
@@ -193,20 +189,25 @@
 					 conn-id
 					 msg))))
 
-(def-con-fun reply (connection req msg)
+(defun reply (req msg &optional (connection *current-connection*))
   "Sends a reply to a request object"
-  (send connection (request-sender req) (request-conn-id req) msg))
+  (declare (type connection connection)
+	   (type request req))
+  (send (request-sender req) (request-conn-id req) msg connection))
 
-(def-con-fun reply-json (connection req data)
+(defun reply-json (req data &optional (connection *current-connection*))
   "Sends a reply to request object, encoding the data as JSON"
-  (reply connection req (json:encode-json-to-string data)))
+  (declare (type connection connection))
+  (reply req (json:encode-json-to-string data) connection))
 
-(def-con-fun reply-http (connection req body &key (code 200) (status "OK") headers)
+(defun reply-http (req body &key (code 200) (status "OK") headers
+		   (connection *current-connection*))
   "Sends a reply to a request, prepending an http header"
   (declare (type string body))
-  (reply connection req (http-response body code status headers)))
+  (reply req (http-response body code status headers) connection))
 
-(defun reply-start-chunk (connection req &key (code 200) (status "OK") headers)
+(defun reply-start-chunk (req &key (code 200) (status "OK")
+			  headers (connection *current-connection*))
   "Starts a chunked-transfer reply to a request, prepending an http header
   
   The usage is like this:
@@ -217,51 +218,58 @@
   This can be used to send parts of a request seperately when you don't know
   the final length.
   "
-  (declare (type list headers))
+  (declare (type list headers)
+	   (type connection connection))
   (let ((headers (acons "Transfer-Encoding" "chunked" headers)))
     (declare (type list headers))
-    (reply connection req 
+    (reply req 
 	   (format-http nil code status
 		   (mapcar (lambda (x) (list (car x) (cdr x))) headers)
-		   ""))))
+		   "") connection)))
 
-(def-con-fun reply-a-chunk (connection req body)
+(defun reply-a-chunk (req body &optional (connection *current-connection*))
   "Sends some data to a request that reply-start-chunk has already been called
   on"
-  (declare (type string body))
-  (reply connection req
-	 (format-chunk nil (length body) body)))
+  (declare (type string body)
+	   (type connection connection))
+  (reply req
+	 (format-chunk nil (length body) body) connection))
 
-(def-con-fun reply-finish-chunk (connection req)
+(defun reply-finish-chunk (req &optional (connection *current-connection*))
   "Finishes a request that reply-start-chunk has already been called on."
-  (reply-a-chunk connection req "")
-  (reply connection req +crlf+))
+  (declare (type connection connection))
+  (reply-a-chunk req "" connection)
+  (reply req +crlf+ connection))
 
-(def-con-fun deliver (connection uuid idents data)
+(defun deliver (uuid idents data &optional (connection *current-connection*))
   "Send message to mongrel2 for all idents"
-  (send connection uuid (string-join " " idents) data))
+  (declare (type connection connection))
+  (send uuid (string-join " " idents) data connection))
 
-(def-con-fun deliver-json (connection uuid idents data)
+(defun deliver-json (uuid idents data &optional (connection *current-connection*))
   "Like deliver, but encode data as JSON"
-  (deliver connection uuid idents (json:encode-json-to-string data)))
+  (declare (type connection connection))
+  (deliver uuid idents (json:encode-json-to-string data) connection))
 
 (defun deliver-http
   (connection uuid idents body &key (code 200) (status "OK") headers)
   "Like deliver, but prepend an HTTP header"
-  (deliver connection uuid idents (http-response body code status headers)))
+  (deliver uuid idents (http-response body code status headers) connection))
 
-(def-con-fun reply-close (connection req)
+(defun reply-close (req &optional (connection *current-connection*))
   "Instruct mongrel2 to close a connection"
-  (reply connection req ""))
+  (declare (type connection connection))
+  (reply req "" connection))
 
 (defun request-closep (req)
   "If this is true, reply-close should  be called at the end of the reply"
-  (or (equalp (cdr (assoc :connection (request-headers req))) "close")
-      (equalp (cdr (assoc :+version+ (request-headers req))) "HTTP/1.0")))
+  (or (equalp (cdr (assoc :|connection| (request-headers req))) "close")
+      (equalp (cdr (assoc :VERSION (request-headers req))) "HTTP/1.0")))
 
-(def-con-fun deliver-close (connection uuid idents)
+(defun deliver-close (uuid idents &optional (connection *current-connection*))
   "Instruct mongrel2 to close all connections in idents"
-  (deliver connection uuid idents ""))
+  (declare (type connection connection))
+  (deliver uuid idents "" connection))
  
 (defun simple-test ()
   (with-connection-nowrap (conn
@@ -270,7 +278,7 @@
 		    "tcp://127.0.0.1:9996")
     (loop
        (let ((req (recv conn)))
-         (reply-http conn req "Hello, World!")))))
+         (reply-http req "Hello, World!" :connection conn)))))
 
 
 (defun example-from-docs ()
@@ -285,46 +293,73 @@
 	   ((request-disconnectp req)
 	    (print "DISCONNECT"))
 	    ;(reply-close conn req))
-	   ((assoc :killme (request-headers req))
+	   ((assoc :|killme| (request-headers req))
 	    (print "They want to be killed.")
 	    (reply-close req))
 	   (t
 	    (reply-http req
 			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
 				(request-sender req) (request-conn-id req)
-				(request-path req) (request-headers req)
+				(request-path req)
+				(let ((json:*lisp-identifier-name-to-json* (lambda (x) x))
+				      (json:*json-identifier-name-to-lisp* (lambda (x) x)))
+				(json:encode-json-to-string (request-headers req)))
 				(request-body req)))
 	    (when (request-closep req)
 	      (reply-close req))))))))
-         
+
+(defun example-from-docs-nowrap ()
+  (with-connection-nowrap (foo
+                     "82209006-86FF-4982-B5EA-D1E29E55D483"
+                     "tcp://127.0.0.1:9997"
+                     "tcp://127.0.0.1:9996")
+                   (loop
+                     ;(print "WAITING FOR REQUEST")
+                     (let ((req (recv foo)))
+                       (cond
+                         ((request-disconnectp req)
+                          (print "DISCONNECT"))
+                         ;(reply-close conn req))
+                         ((assoc :|killme| (request-headers req))
+                          (print "They want to be killed.")
+                          (reply-close foo req))
+                         (t
+                           (reply-http req
+                                       (format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
+                                               (request-sender req) (request-conn-id req)
+                                               (request-path req) (request-headers req)
+                                               (request-body req))
+				       :connection foo)
+                           (when (request-closep req)
+                             (reply-close foo req))))))))
 
 (defun test-chunking ()
-  (with-connection-nowrap (conn
+  (with-connection(conn
 		    "82209006-86FF-4982-B5EA-D1E29E55D483"
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
     (loop
        ;(print "WAITING FOR REQUEST")
-       (let ((req (recv conn)))
+       (let ((req (recv)))
 	 (cond
 	   ((request-disconnectp req)
 	    (print "DISCONNECT"))
-	   ((assoc :killme (request-headers req))
+	   ((assoc :|killme| (request-headers req))
 	    (print "They want to be killed.")
-	    (reply-http conn req ""))
+	    (reply-http req ""))
 	   (t
-	    (reply-start-chunk conn req)
-	    (reply-a-chunk conn req
+	    (reply-start-chunk req)
+	    (reply-a-chunk req
 			   "<http><head><title>foo</title></head><body>")
-	    (reply-a-chunk conn req
+	    (reply-a-chunk req
 			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&"
 				(request-sender req) (request-conn-id req)))
-	    (reply-a-chunk conn req
+	    (reply-a-chunk req
 			(format nil "PATH: ~A~&HEADERS: ~A"
 				(request-path req) (request-headers req)))
-	    (reply-a-chunk conn req
+	    (reply-a-chunk req
 			(format nil "~&BODY~A</pre>" (request-body req)))
-	    (reply-finish-chunk conn req)))
+	    (reply-finish-chunk req)))
 	 (when (request-closep req)
-	   (reply-close conn req))))))
+	   (reply-close req))))))
 

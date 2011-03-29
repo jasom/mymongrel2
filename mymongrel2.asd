@@ -3,7 +3,8 @@
 (asdf:defsystem #:mymongrel2
   :serial t
   :depends-on (#:zeromq
-               #:cl-json)
+               #:cl-json
+	       #:tnetstring)
   :components ((:file "package")
                (:file "mymongrel2")))
 
