@@ -301,9 +301,7 @@
 			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
 				(request-sender req) (request-conn-id req)
 				(request-path req)
-				(let ((json:*lisp-identifier-name-to-json* (lambda (x) x))
-				      (json:*json-identifier-name-to-lisp* (lambda (x) x)))
-				(json:encode-json-to-string (request-headers req)))
+				(request-headers req)
 				(request-body req)))
 	    (when (request-closep req)
 	      (reply-close req))))))))
