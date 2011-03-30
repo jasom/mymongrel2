@@ -1,4 +1,5 @@
 (declaim (optimize (speed 3)))
+;(declaim (optimize (debug 3)))
 (in-package :mymongrel2)
 
 (eval-when (:compile-toplevel :load-toplevel :execute) (defvar *con-fun-list* nil))
@@ -93,7 +94,7 @@
                         when (null j) return splits))))
 
 
-(defstruct request ()
+(defstruct request
 	   (sender)
 	   (conn-id)
 	   (path)
@@ -107,36 +108,32 @@
        (equalp (cdr (assoc :|type| (myjson-decode (request-body req)))) "disconnect")))
 
 
-(defun mongrel2-header1 (s)
-  (values
-   (with-output-to-string (out)
-     (loop for c = (tnetstring::fss-read-char s)
-	  while (not (eql c #\Space))
-	  do (write-char c out)))
-   (with-output-to-string (out)
-     (loop for c = (tnetstring::fss-read-char s)
-	  while (not (eql c #\Space))
-	  do (write-char c out)))
-   (with-output-to-string (out)
-     (loop for c = (tnetstring::fss-read-char s)
-	  while (not (eql c #\Space))
-	  do (write-char c out)))))
+(defun read-to-space (string pos)
+  (declare (type simple-string string)
+	   (type fixnum pos))
+  (values (with-output-to-string (out)
+	    (loop for c = (aref string pos)
+	       do (incf pos)
+	       while (not (eql c #\Space))
+	       do (write-char c out))) pos))
 
 
+;TODO start using metabang-bind?
 (defun parse (msg)
   "Parses out the mongrel2 message format which is:
   UUID ID PATH SIZE:HEADERS,SIZE:BODY,"
-  (let ((fss
-	 (tnetstring::make-fake-string-stream :data msg :length (length msg))))
-  (multiple-value-bind (sender conn-id path) (mongrel2-header1 fss)
-    (let* ((headers (tnetstring::parse-tnetstream fss))
-	   (body (tnetstring::parse-tnetstream fss))
-	   (headers (myjson-decode headers)))
+  (declare (type simple-string msg))
+  (multiple-value-bind (sender pos) (read-to-space msg 0)
+    (multiple-value-bind (conn-id pos) (read-to-space msg pos)
+      (multiple-value-bind (path pos) (read-to-space msg pos)
+	(multiple-value-bind (headers pos) (tnetstring:parse-tnetstring msg pos)
+	  (let ((headers (myjson-decode headers))
+		(body (tnetstring:parse-tnetstring msg pos)))
 	(make-request :sender sender
 		      :conn-id conn-id
 		      :path path
 		      :headers headers
-		      :body body)))))
+		      :body body)))))))
 
 (defclass connection ()
   ((sender-id  :initarg :sender-id)
@@ -281,14 +278,16 @@
          (reply-http req "Hello, World!" :connection conn)))))
 
 
-(defun example-from-docs ()
+(defun example-from-docs (&key (sender-id "82209006-86FF-4982-B5EA-D1E29E55D483") verbose)
   (with-connection (foo
-		    "82209006-86FF-4982-B5EA-D1E29E55D483"
+		    sender-id
 		    "tcp://127.0.0.1:9997"
 		    "tcp://127.0.0.1:9996")
     (loop
-       ;(print "WAITING FOR REQUEST")
+       (when verbose (print "WAITING FOR REQUEST"))
        (let ((req (recv)))
+	 (when verbose (print "Receive complete"))
+	 (when verbose (print req))
 	 (cond
 	   ((request-disconnectp req)
 	    (print "DISCONNECT"))
@@ -297,6 +296,7 @@
 	    (print "They want to be killed.")
 	    (reply-close req))
 	   (t
+	    (when verbose (print "Sending Reply"))
 	    (reply-http req
 			(format nil "<pre>~&SENDER: ~A~&IDENT: ~A~&PATH: ~A~&HEADERS: ~A~&BODY~A</pre>"
 				(request-sender req) (request-conn-id req)
