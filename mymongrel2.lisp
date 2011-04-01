@@ -156,7 +156,7 @@
 				    :reqs reqs
 				    :resp resp)))
     (zmq:connect reqs sub-addr)
-    (handler-bind ((t (lambda (x) (zmq:close reqs))))
+    (handler-bind ((t (lambda (x) (zmq:close reqs) (signal x))))
 	   (zmq:setsockopt resp zmq:IDENTITY sender-id)
 	   (zmq:connect resp connection))))
 
