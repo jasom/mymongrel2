@@ -127,7 +127,9 @@
     (multiple-value-bind (conn-id pos) (read-to-space msg pos)
       (multiple-value-bind (path pos) (read-to-space msg pos)
 	(multiple-value-bind (headers pos) (tnetstring:parse-tnetstring msg pos)
-	  (let ((headers (myjson-decode headers))
+	  (let ((headers (if (typep headers 'string)
+			    (myjson-decode headers)
+			    headers))
 		(body (tnetstring:parse-tnetstring msg pos)))
 	(make-request :sender sender
 		      :conn-id conn-id
@@ -154,9 +156,9 @@
 				    :reqs reqs
 				    :resp resp)))
     (zmq:connect reqs sub-addr)
-    (zmq:setsockopt resp zmq:IDENTITY sender-id)
-    (zmq:connect resp pub-addr)
-    connection))
+    (handler-bind ((t (lambda (x) (zmq:close reqs))))
+	   (zmq:setsockopt resp zmq:IDENTITY sender-id)
+	   (zmq:connect resp connection))))
 
 (defun close-connection (c)
   "Closes the connection given to it."
