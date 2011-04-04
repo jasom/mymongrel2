@@ -158,7 +158,8 @@
     (zmq:connect reqs sub-addr)
     (handler-bind ((t (lambda (x) (zmq:close reqs) (signal x))))
 	   (zmq:setsockopt resp zmq:IDENTITY sender-id)
-	   (zmq:connect resp connection))))
+	   (zmq:connect resp pub-addr))
+    connection))
 
 (defun close-connection (c)
   "Closes the connection given to it."
