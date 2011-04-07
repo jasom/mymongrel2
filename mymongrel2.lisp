@@ -76,24 +76,6 @@
 		    collect separator
 		    collect i))))
 
-(defun split-by-char (strng &key (split-char #\Space) (max-splits nil))
-  "Returns a list of substrings split by :split-char.  Will only split
-  enough times to create :max-splits strings"
-  (if strng
-    (let ((string strng))
-      (declare (type string string)
-	       (type (or nil fixnum) max-splits)
-	       (type character split-char))
-      (loop for i fixnum = 0 then (1+ j)
-            for count fixnum = 1 then (1+ count)
-		      as j = (position split-char string :start i)
-                        when (and max-splits (= count max-splits))
-                          collect (subseq string i) into splits
-                          and return splits
-                        collect (subseq string i j) into splits
-                        when (null j) return splits))))
-
-
 (defstruct request
 	   (sender)
 	   (conn-id)
@@ -252,7 +234,7 @@
   (deliver uuid idents (json:encode-json-to-string data) connection))
 
 (defun deliver-http
-  (connection uuid idents body &key (code 200) (status "OK") headers)
+  (uuid idents body &key (code 200) (status "OK") headers (connection *current-connection*))
   "Like deliver, but prepend an HTTP header"
   (deliver uuid idents (http-response body code status headers) connection))
 
