@@ -60,10 +60,24 @@
 	    (progn ,@body)
 	 (close-connection ,conn))))
 
+;Sadly this is way faster on sbcl then the simpler
+;(map 'string #'code-char bytes)
+(defun bytes-to-string (bytes)
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (let* ((length (length bytes))
+         (s (make-string length)))
+    (dotimes (i length)
+      (setf (aref s i) (code-char (aref bytes i))))
+    s))
+
+
 (defun http-response (body code status headers)
   "Generates an http response; used internally"
-  (declare (type string body))
-  (let ((headers (acons "Content-Length" (length body) headers)))
+  (declare (type vector body))
+  (let ((headers (acons "Content-Length" (length body) headers))
+        (body (if (typep body 'string)
+                body
+                (bytes-to-string body))))
     (format-http nil code status
 	    (mapcar (lambda (x) (list (car x) (cdr x))) headers)
 	    body)))
@@ -163,20 +177,26 @@
 (defun send (uuid conn-id msg &optional (connection *current-connection*))
   "Sends a single message to mongrel2"
   (declare (type connection connection))
-  (declare (type vector conn-id))
+  (declare (type vector conn-id msg))
   ;TODO can optimize by eliminating a copy here
   ;
-  (let* ((fmsg (format nil "~A ~A:~A, ~A"
-		      uuid
-		      (length conn-id)
-		      conn-id
-		      msg))
+  (let* ((fmsg (format nil "~A ~A:~A, "
+		       uuid
+		       (length conn-id)
+		       conn-id))
+	 (fmsg (if fmsg fmsg ""))
 	 (zmsg (make-instance 'zmq:msg))
-	 (len (length fmsg)))
-    (zmq:msg-init-size zmsg len)
+	 (hlen (length fmsg))
+	 (mlen (length msg)))
+    (declare (type string fmsg))
+    (zmq:msg-init-size zmsg (+ hlen mlen))
     (let ((p (zmq:msg-data-as-is zmsg)))
-      (print p)
-      (dotimes (i len) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
+      (dotimes (i hlen) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
+      (etypecase msg
+        (string
+          (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (char-code (aref msg i)))))
+        ((simple-array (unsigned-byte 8) (*))
+          (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (aref msg i)))))
       (zmq:send (slot-value connection 'resp) zmsg))))
 
 (defun reply (req msg &optional (connection *current-connection*))
@@ -193,7 +213,7 @@
 (defun reply-http (req body &key (code 200) (status "OK") headers
 		   (connection *current-connection*))
   "Sends a reply to a request, prepending an http header"
-  (declare (type string body))
+  (declare (type vector body))
   (reply req (http-response body code status headers) connection))
 
 (defun reply-start-chunk (req &key (code 200) (status "OK")
