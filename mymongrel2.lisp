@@ -164,13 +164,20 @@
   "Sends a single message to mongrel2"
   (declare (type connection connection))
   (declare (type vector conn-id))
-  (zmq:send (slot-value connection 'resp)
-	    (make-instance 'zmq:msg
-			   :data (format nil "~A ~A:~A, ~A"
-					 uuid
-					 (length conn-id)
-					 conn-id
-					 msg))))
+  ;TODO can optimize by eliminating a copy here
+  ;
+  (let* ((fmsg (format nil "~A ~A:~A, ~A"
+		      uuid
+		      (length conn-id)
+		      conn-id
+		      msg))
+	 (zmsg (make-instance 'zmq:msg))
+	 (len (length fmsg)))
+    (zmq:msg-init-size zmsg len)
+    (let ((p (zmq:msg-data-as-is zmsg)))
+      (print p)
+      (dotimes (i len) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
+      (zmq:send (slot-value connection 'resp) zmsg))))
 
 (defun reply (req msg &optional (connection *current-connection*))
   "Sends a reply to a request object"
