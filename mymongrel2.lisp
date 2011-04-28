@@ -5,6 +5,7 @@
 (eval-when (:compile-toplevel :load-toplevel :execute) (defvar *con-fun-list* nil))
 
 
+(defconstant +deliver-max+ 128)
 (defvar *current-connection* nil)
 
 (defparameter *zmq-context* nil)
@@ -226,7 +227,12 @@
 (defun deliver (uuid idents data &optional (connection *current-connection*))
   "Send message to mongrel2 for all idents"
   (declare (type connection connection))
-  (send uuid (string-join " " idents) data connection))
+  (multiple-value-bind (idents more)
+      (if (<= (length idents) +deliver-max+)
+	  idents
+	  (values (subseq idents 0 +deliver-max+) (subseq idents +deliver-max+)))
+    (send uuid (string-join " " idents) data connection)
+    (when more (deliver uuid more data connection))))
 
 (defun deliver-json (uuid idents data &optional (connection *current-connection*))
   "Like deliver, but encode data as JSON"
