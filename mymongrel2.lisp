@@ -5,6 +5,7 @@
 (eval-when (:compile-toplevel :load-toplevel :execute) (defvar *con-fun-list* nil))
 
 
+
 (defconstant +deliver-max+ 128)
 (defvar *current-connection* nil)
 
@@ -14,10 +15,9 @@
     (unless *zmq-context* (setq *zmq-context* (zmq:init threads))))
 
 (defun zmq-recv-string (socket)
-  (let ((query (make-instance 'zmq:msg))
-	(cffi:*default-foreign-encoding* :iso-8859-1))
+  (let ((query (make-instance 'zmq:msg)))
     (zmq:recv socket query)
-    (zmq:msg-data-as-string query)))
+    (zmq:msg-data-as-array query)))
 
 (defparameter +crlf+ "
 ")
@@ -106,20 +106,18 @@
 
 
 (defun read-to-space (string pos)
-  (declare (type simple-string string)
-	   (type fixnum pos))
-  (values (with-output-to-string (out)
-	    (loop for c = (aref string pos)
-	       do (incf pos)
-	       while (not (eql c #\Space))
-	       do (write-char c out))) pos))
+  (declare (type (simple-array (unsigned-byte 8) (*)) string)
+	   (type fixnum pos)
+	   (optimize (speed 0) (debug 3)))
+  (let ((end (position #.(char-code #\Space) string :start pos)))
+    (values (subseq string pos end) (1+ end))))
 
 
 ;TODO start using metabang-bind?
 (defun parse (msg)
   "Parses out the mongrel2 message format which is:
   UUID ID PATH SIZE:HEADERS,SIZE:BODY,"
-  (declare (type simple-string msg))
+  (declare (type (simple-array (unsigned-byte 8) (*)) msg))
   (multiple-value-bind (sender pos) (read-to-space msg 0)
     (multiple-value-bind (conn-id pos) (read-to-space msg pos)
       (multiple-value-bind (path pos) (read-to-space msg pos)
@@ -181,9 +179,9 @@
   ;TODO can optimize by eliminating a copy here
   ;
   (let* ((fmsg (format nil "~A ~A:~A, "
-		       uuid
+		       (bytes-to-string uuid)
 		       (length conn-id)
-		       conn-id))
+		       (bytes-to-string conn-id)))
 	 (fmsg (if fmsg fmsg ""))
 	 (zmsg (make-instance 'zmq:msg))
 	 (hlen (length fmsg))
@@ -378,4 +376,5 @@
 	    (reply-finish-chunk req)))
 	 (when (request-closep req)
 	   (reply-close req))))))
+
 
