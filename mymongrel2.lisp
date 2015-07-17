@@ -9,15 +9,23 @@
 (defconstant +deliver-max+ 128)
 (defvar *current-connection* nil)
 
-(defparameter *zmq-context* nil)
 
-(defun ensure-zmq-init (&optional (threads 1))
-    (unless *zmq-context* (setq *zmq-context* (zmq:init threads))))
+(defun msg-data-as-array (msg)
+  (let* ((data (pzmq:msg-data msg))
+	(size (pzmq:msg-size msg))
+	(output (make-array size :element-type '(unsigned-byte 8))))
+    (loop for i from 0 below size
+	 do (setf (aref output i) (cffi:mem-aref data :uint8 i)))
+    output))
 
-(defun zmq-recv-string (socket)
-  (let ((query (make-instance 'zmq:msg)))
-    (zmq:recv socket query)
-    (zmq:msg-data-as-array query)))
+(defun zmq-recv-bytes (socket)
+  (pzmq:with-message query
+    (loop
+       for result =
+	 (handler-case (pzmq:msg-recv query socket)
+	   (pzmq:eintr () nil))
+       while (not result))
+    (msg-data-as-array query)))
 
 (defparameter +crlf+ "
 ")
@@ -36,9 +44,10 @@
 ~A" rest))
 
 (defun myjson-decode (s)
-  (let ((json:*lisp-identifier-name-to-json* (lambda (x) x))
-	(json:*json-identifier-name-to-lisp* (lambda (x) x)))
-    (json:decode-json-from-string s)))
+  (let ((s (bytes-to-string s)))
+    (let ((json:*lisp-identifier-name-to-json* (lambda (x) x))
+	  (json:*json-identifier-name-to-lisp* (lambda (x) x)))
+      (json:decode-json-from-string s))))
 
 
 (defmacro with-connection ((conn &rest init-args)
@@ -122,9 +131,9 @@
     (multiple-value-bind (conn-id pos) (read-to-space msg pos)
       (multiple-value-bind (path pos) (read-to-space msg pos)
 	(multiple-value-bind (headers pos) (tnetstring:parse-tnetstring msg pos)
-	  (let ((headers (if (typep headers 'string)
-			    (myjson-decode headers)
-			    headers))
+	  (let ((headers (if (typep headers 'array)
+			     (myjson-decode headers)
+			     headers))
 		(body (tnetstring:parse-tnetstring msg pos)))
 	(make-request :sender sender
 		      :conn-id conn-id
@@ -139,33 +148,32 @@
    (reqs :initarg :reqs)
    (resp :initarg :resp)))
 
-(defun make-connection (sender-id sub-addr pub-addr)
+(defun make-connection (sender-id sub-addr pub-addr &optional (context (pzmq:ctx-new)))
   "Makes a new connection object.  Consider using with-connection instead"
-  (ensure-zmq-init)
-  (let* ((reqs (zmq:socket *zmq-context* zmq:PULL))
-	 (resp (zmq:socket *zmq-context* zmq:PUB))
+  (let* ((reqs (pzmq:socket context :PULL))
+	 (resp (pzmq:socket context :PUB))
 	 (connection (make-instance 'connection
 				    :sender-id sender-id
 				    :sub-addr sub-addr
 				    :pub-addr pub-addr
 				    :reqs reqs
 				    :resp resp)))
-    (zmq:connect reqs sub-addr)
-    (handler-bind ((t (lambda (x) (zmq:close reqs) (signal x))))
-	   (zmq:setsockopt resp zmq:IDENTITY sender-id)
-	   (zmq:connect resp pub-addr))
+    (pzmq:connect reqs sub-addr)
+    (handler-bind ((t (lambda (x) (pzmq:close reqs) (signal x))))
+	   (pzmq:setsockopt resp :IDENTITY sender-id)
+	   (pzmq:connect resp pub-addr))
     connection))
 
 (defun close-connection (c)
   "Closes the connection given to it."
-  (zmq:close (slot-value c 'reqs))
-  (zmq:close (slot-value c 'resp)))
+  (pzmq:close (slot-value c 'reqs))
+  (pzmq:close (slot-value c 'resp)))
 
 
 (defun recv (&optional (connection *current-connection*))
   "Receives a single message from mongrel2"
   (declare (type connection connection))
-  (parse (zmq-recv-string (slot-value connection 'reqs))))
+  (parse (zmq-recv-bytes (slot-value connection 'reqs))))
 
 (defun recv-json (&optional (connection *current-connection*))
   "Receives a single message from mongrel2 and decodes as JSON"
@@ -176,26 +184,25 @@
   "Sends a single message to mongrel2"
   (declare (type connection connection))
   (declare (type vector conn-id msg))
-  ;TODO can optimize by eliminating a copy here
-  ;
+  ;;TODO can optimize by eliminating a copy here
   (let* ((fmsg (format nil "~A ~A:~A, "
 		       (bytes-to-string uuid)
 		       (length conn-id)
 		       (bytes-to-string conn-id)))
 	 (fmsg (if fmsg fmsg ""))
-	 (zmsg (make-instance 'zmq:msg))
 	 (hlen (length fmsg))
 	 (mlen (length msg)))
     (declare (type string fmsg))
-    (zmq:msg-init-size zmsg (+ hlen mlen))
-    (let ((p (zmq:msg-data-as-is zmsg)))
-      (dotimes (i hlen) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
-      (etypecase msg
-        (string
-          (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (char-code (aref msg i)))))
-        ((simple-array (unsigned-byte 8) (*))
-          (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (aref msg i)))))
-      (zmq:send (slot-value connection 'resp) zmsg))))
+    (pzmq:with-message zmsg
+      (pzmq:msg-init-size zmsg (+ hlen mlen))
+      (let ((p (pzmq::msg-data zmsg)))
+	(dotimes (i hlen) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
+	(etypecase msg
+	  (string
+	   (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (char-code (aref msg i)))))
+	  ((simple-array (unsigned-byte 8) (*))
+	   (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (aref msg i)))))
+	(pzmq:msg-send zmsg (slot-value connection 'resp))))))
 
 (defun reply (req msg &optional (connection *current-connection*))
   "Sends a reply to a request object"

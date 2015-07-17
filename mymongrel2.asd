@@ -2,7 +2,7 @@
 
 (asdf:defsystem #:mymongrel2
   :serial t
-  :depends-on (#:zeromq
+  :depends-on (#:pzmq
                #:cl-json
 	       #:tnetstring)
   :components ((:file "package")
