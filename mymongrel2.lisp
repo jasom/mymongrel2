@@ -30,7 +30,7 @@
   (pzmq::with-c-error-check (:int t)
     (%zmq-recv socket buf size flags)))
 
-(defun zmq-recv-bytes (socket &key dontwait)
+#+(or)(defun zmq-recv-bytes (socket &key dontwait)
   "Receive a message part from a socket as bytes."
   (pzmq:with-message msg
     (pzmq:msg-recv msg socket :dontwait dontwait)
@@ -43,6 +43,20 @@
     (values
      output
      (pzmq:getsockopt socket :rcvmore)))))
+
+(defun zmq-recv-bytes (socket &optional (buffer-size #x100000))
+  (let (ptr)
+    (unwind-protect
+	 (progn
+	   (setf ptr (cffi:foreign-alloc :uint8 :count buffer-size))
+	   (let* ((total-len (zmq-recv socket ptr buffer-size 0))
+		  (output (make-array total-len :element-type '(unsigned-byte 8))))
+	     (when (> total-len buffer-size) (error "Truncated buffer when receiving ~D bytes" total-len))
+	     (loop
+		for i from 0 below total-len
+		do (setf (aref output i) (cffi:mem-aref ptr :uint8 i)))
+	     output))
+      (and ptr (cffi:foreign-free ptr)))))
 
 (defparameter +crlf+ "
 ")
