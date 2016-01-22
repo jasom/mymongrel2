@@ -18,14 +18,31 @@
 	 do (setf (aref output i) (cffi:mem-aref data :uint8 i)))
     output))
 
-(defun zmq-recv-bytes (socket)
-  (pzmq:with-message query
-    (loop
-       for result =
-	 (handler-case (pzmq:msg-recv query socket)
-	   (pzmq:eintr () nil))
-       while (not result))
-    (msg-data-as-array query)))
+(cffi:defcfun ("zmq_recv" %zmq-recv) :int
+  "Receive a message part from a socket."
+  (socket :pointer)
+  (buf :pointer)
+  (len :unsigned-long)
+  (flags :int))
+
+;(declaim (notinline zmq-recv))
+(defun zmq-recv (socket buf size flags)
+  (pzmq::with-c-error-check (:int t)
+    (%zmq-recv socket buf size flags)))
+
+(defun zmq-recv-bytes (socket &key dontwait)
+  "Receive a message part from a socket as bytes."
+  (pzmq:with-message msg
+    (pzmq:msg-recv msg socket :dontwait dontwait)
+    (let*
+	((size (pzmq:msg-size msg))
+	 (data (pzmq:msg-data msg))
+	 (output (make-array size :element-type '(unsigned-byte 8))))
+      (loop for i from 0 below size
+	 do (setf (aref output i) (cffi:mem-aref data :uint8 i)))
+    (values
+     output
+     (pzmq:getsockopt socket :rcvmore)))))
 
 (defparameter +crlf+ "
 ")
@@ -73,12 +90,8 @@
 ;(map 'string #'code-char bytes)
 (defun bytes-to-string (bytes)
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
-  (let* ((length (length bytes))
-         (s (make-string length)))
-    (dotimes (i length)
-      (setf (aref s i) (code-char (aref bytes i))))
-    s))
-
+  (let ((s (make-string (length bytes))))
+    (map-into s #'code-char bytes)))
 
 (defun http-response (body code status headers)
   "Generates an http response; used internally"
@@ -107,12 +120,10 @@
 	   (headers)
 	   (body))
 
-
 (defun request-disconnectp (req)
   "Returns true if a request should be followed by a disconnect"
   (and (equalp (cdr (assoc :METHOD (request-headers req))) "JSON")
        (equalp (cdr (assoc :|type| (myjson-decode (request-body req)))) "disconnect")))
-
 
 (defun read-to-space (string pos)
   (declare (type (simple-array (unsigned-byte 8) (*)) string)
@@ -169,10 +180,10 @@
   (pzmq:close (slot-value c 'reqs))
   (pzmq:close (slot-value c 'resp)))
 
-
 (defun recv (&optional (connection *current-connection*))
   "Receives a single message from mongrel2"
   (declare (type connection connection))
+  (print (slot-value connection 'reqs))
   (parse (zmq-recv-bytes (slot-value connection 'reqs))))
 
 (defun recv-json (&optional (connection *current-connection*))
@@ -192,7 +203,8 @@
 	 (fmsg (if fmsg fmsg ""))
 	 (hlen (length fmsg))
 	 (mlen (length msg)))
-    (declare (type string fmsg))
+    (declare (type string fmsg)
+	     (type fixnum hlen mlen))
     (pzmq:with-message zmsg
       (pzmq:msg-init-size zmsg (+ hlen mlen))
       (let ((p (pzmq::msg-data zmsg)))
@@ -258,7 +270,8 @@
 
 (defun deliver (uuid idents data &optional (connection *current-connection*))
   "Send message to mongrel2 for all idents"
-  (declare (type connection connection))
+  (declare (type connection connection)
+	   (type list idents))
   (multiple-value-bind (idents more)
       (if (<= (length idents) +deliver-max+)
 	  idents
