@@ -219,16 +219,18 @@
 	 (mlen (length msg)))
     (declare (type string fmsg)
 	     (type fixnum hlen mlen))
-    (pzmq:with-message zmsg
-      (pzmq:msg-init-size zmsg (+ hlen mlen))
-      (let ((p (pzmq::msg-data zmsg)))
-	(dotimes (i hlen) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
-	(etypecase msg
-	  (string
-	   (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (char-code (aref msg i)))))
-	  ((simple-array (unsigned-byte 8) (*))
-	   (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (aref msg i)))))
-	(pzmq:msg-send zmsg (slot-value connection 'resp))))))
+    (let (p)
+      (unwind-protect
+	 (progn
+	   (setf p (cffi::foreign-alloc :unsigned-char :count (+ hlen mlen)))
+	   (dotimes (i hlen) (setf (cffi:mem-ref p :unsigned-char i) (char-code (aref fmsg i))))
+	   (etypecase msg
+	     (string
+	      (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (char-code (aref msg i)))))
+	     ((simple-array (unsigned-byte 8) (*))
+	      (dotimes (i mlen) (setf (cffi:mem-ref p :unsigned-char (+ hlen i)) (aref msg i)))))
+	   (pzmq:send (slot-value connection 'resp) p :len (+ hlen mlen)))
+	(cffi:foreign-free p)))))
 
 (defun reply (req msg &optional (connection *current-connection*))
   "Sends a reply to a request object"
